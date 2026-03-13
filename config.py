@@ -20,7 +20,7 @@ DEFAULT_CONFIG = {
     "max_connections": constants.MAX_CONNECTIONS,
     "connection_timeout": 300,
     "log_scan_interval": 5,
-    "sshd_log_path": "/data/data/com.termux/files/usr/var/auth.log",
+    "sshd_log_path": constants.DEFAULT_SSHD_LOG_PATH,
     "failures_to_ban": constants.MAX_FAILURES,
     "ban_duration": constants.DEFAULT_BAN_DURATION,
     "failure_window": constants.FAILURE_WINDOW,
