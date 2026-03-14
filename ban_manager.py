@@ -3,7 +3,6 @@ IP封禁管理器：支持IP封禁、解封和失败记录管理
 """
 
 import json
-import logging
 import os
 import threading
 import time
@@ -12,7 +11,9 @@ from datetime import datetime
 
 import constants
 
-logger = logging.getLogger(__name__)
+from cfpackages.logger_formatter import get_logger
+
+logger = get_logger(__name__)
 
 
 def ensure_file_path(path):
@@ -37,19 +38,17 @@ def ensure_file_path(path):
 class BanManager:
     """封禁管理器 - 支持自动解封"""
 
-    def __init__(self, ban_duration=3600):
+    def __init__(self, ban_duration=3600, max_failures=5, failure_window=600):
         self.ban_duration = ban_duration
+        self.max_failures = max_failures
+        self.failure_window = failure_window
+
         # 格式: {ip: {"block_until": timestamp, "reason": str, "banned_at": timestamp}}
         self.blacklist = {}
         self.failure_count = defaultdict(
             lambda: deque(maxlen=10)
         )
-        # 端口失败记录，用于避免同一个端口的多次失败重复计数
-        self.port_failures = {}  # port: timestamp
         self.lock = threading.Lock()
-        self.max_failures = 5
-        self.failure_window = 600  # 10分钟窗口
-        self.port_window = 300  # 5分钟内同一个端口的失败只计数一次
 
         # 加载已保存的黑名单
         self.load_blacklist()
@@ -191,13 +190,13 @@ class BanManager:
             except (OSError, IOError) as e:
                 logger.error("记录清理日志失败: %s", e)
 
-    def record_failure(self, ip, port):
+    def record_failure(self, ip, port=None):
         """
         记录认证失败，返回当前失败次数
         
         Args:
             ip: 客户端IP
-            port: 客户端端口
+            port: 客户端端口（保留参数，不再用于去重）
             
         Returns:
             失败次数
@@ -205,26 +204,6 @@ class BanManager:
         with self.lock:
             now = time.time()
             
-            # 检查这个端口在5分钟内是否已经记录过失败
-            if port in self.port_failures:
-                last_fail_time = self.port_failures[port]
-                if now - last_fail_time < self.port_window:
-                    # 5分钟内同一个端口的失败，不重复计数
-                    failure_count = len(self.failure_count[ip])
-                    logger.debug("端口 %s 在5分钟内已记录过失败，跳过计数", port)
-                    return failure_count
-            
-            # 记录端口失败时间
-            self.port_failures[port] = now
-            
-            # 清理过期的端口失败记录
-            expired_ports = [
-                p for p, t in self.port_failures.items()
-                if now - t >= self.port_window
-            ]
-            for p in expired_ports:
-                del self.port_failures[p]
-
             # 添加当前失败时间
             self.failure_count[ip].append(now)
 
@@ -241,7 +220,7 @@ class BanManager:
 
             # 检查是否达到封禁阈值
             if failure_count >= self.max_failures and not self.is_banned(ip):
-                self.ban_ip(ip, reason=f"{failure_count}次认证失败 (10分钟内)")
+                self.ban_ip(ip, reason=f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
                 return failure_count
 
             return failure_count
@@ -289,7 +268,7 @@ class BanManager:
             return bans
 
     def _cleanup_loop(self):
-        """定期清理过期封禁和端口记录"""
+        """定期清理过期封禁"""
         while True:
             time.sleep(300)  # 每5分钟清理一次
             try:
@@ -312,17 +291,6 @@ class BanManager:
                         logger.info("清理了 %s 个过期封禁", cleaned_count)
                         self.save_blacklist()
                         self._log_cleanup(cleaned_count)
-                    
-                    # 清理过期的端口失败记录
-                    expired_ports = [
-                        port for port, timestamp in self.port_failures.items()
-                        if now - timestamp >= self.port_window
-                    ]
-                    for port in expired_ports:
-                        del self.port_failures[port]
-                        
-                    if expired_ports:
-                        logger.debug("清理了 %s 个过期的端口失败记录", len(expired_ports))
                         
             except (OSError, IOError) as e:
                 logger.error("清理过期记录时出错: %s", e)

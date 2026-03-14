@@ -19,13 +19,15 @@ from ban_manager import BanManager
 from config import load_config, validate_config, save_config
 import constants
 
+from cfpackages.logger_formatter import get_logger
+
 # 配置日志
-logging.basicConfig(
-    level=constants.DEFAULT_LOG_LEVEL,
-    format=constants.LOG_FORMAT,
-    handlers=[logging.FileHandler(constants.SSH_PROXY_LOG), logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
+# logging.basicConfig(
+#     level=constants.DEFAULT_LOG_LEVEL,
+#     format=constants.LOG_FORMAT,
+#     handlers=[logging.FileHandler(constants.SSH_PROXY_LOG), logging.StreamHandler()],
+# )
+logger = get_logger(__name__)
 
 
 def ensure_file_path(path):
@@ -72,8 +74,12 @@ class SSHProxy:
         if not is_valid:
             raise ValueError(f"配置无效: {error_msg}")
         
-        # 初始化组件
-        self.ban_manager = BanManager(ban_duration=self.config["ban_duration"])
+        # 初始化组件 - 传递所有封禁相关参数
+        self.ban_manager = BanManager(
+            ban_duration=self.config["ban_duration"],
+            max_failures=self.config["failures_to_ban"],
+            failure_window=self.config["failure_window"]
+        )
         self.conn_manager = ConnectionManager(
             max_connections=self.config["max_connections"],
             connection_timeout=self.config["connection_timeout"],
@@ -87,7 +93,11 @@ class SSHProxy:
         self.server_socket = None
         self.running = False
 
+        # 日志扫描锁
+        self.log_lock = threading.Lock()
+
         logger.info("SSH代理初始化完成")
+        logger.info("封禁阈值: %s次/%s秒", self.config["failures_to_ban"], self.config["failure_window"])
 
     def create_sshd_connection(self):
         """创建到sshd的连接"""
@@ -184,7 +194,7 @@ class SSHProxy:
                 )
 
                 if xlist:
-                    logger.debug("连接 #%s 异常", conn_id)
+                    logger.info("连接 #%s 异常", conn_id)
                     break
 
                 data_transferred = False
@@ -193,14 +203,14 @@ class SSHProxy:
                         if not self._handle_socket_data(
                             client_sock, sshd_sock, thread_id, "sent"
                         ):
-                            logger.debug("连接 #%s 客户端关闭连接", conn_id)
+                            logger.info("连接 #%s 客户端关闭连接", conn_id)
                             return
                         data_transferred = True
                     elif sock is sshd_sock:
                         if not self._handle_socket_data(
                             sshd_sock, client_sock, thread_id, "received"
                         ):
-                            logger.debug("连接 #%s sshd关闭连接", conn_id)
+                            logger.info("连接 #%s sshd关闭连接", conn_id)
                             return
                         data_transferred = True
 
@@ -214,6 +224,11 @@ class SSHProxy:
         except (select.error, socket.error) as e:
             logger.error("连接 #%s 转发数据时出错: %s", conn_id, e)
         finally:
+            # 等待一小段时间，确保日志已写入
+            time.sleep(0.1)
+            # 立即扫描一次日志，以便处理该连接可能产生的失败
+            self._scan_logs()
+
             # 清理资源
             try:
                 client_sock.close()
@@ -241,6 +256,7 @@ class SSHProxy:
             # 解析Proxy Protocol
             logger.debug("开始解析Proxy Protocol...")
             real_ip, real_port = ProxyProtocolParser.parse(client_sock)
+            logger.debug("解析完毕!")
 
             if real_ip is None:
                 # 不是Proxy Protocol，使用连接地址
@@ -270,9 +286,9 @@ class SSHProxy:
 
                 # 发送拒绝消息
                 try:
-                    client_sock.sendall(b"SSH-2.0-OpenSSH_8.9\r\n")
+                    # client_sock.sendall(b"SSH-2.0-OpenSSH_8.9\r\n")
                     client_sock.sendall(
-                        b"Connection refused: Your IP has been blocked.\r\n"
+                        b"Connection refused: Your IP has been blocked.\n"
                     )
                     time.sleep(1)
                 except (socket.error, OSError):
@@ -331,8 +347,11 @@ class SSHProxy:
             logger.error("创建SSH日志文件失败 %s: %s", log_file, e)
             return False
 
-    def monitor_sshd_logs(self):
-        """监控sshd日志，检测认证失败"""
+    def _scan_logs(self):
+        """
+        扫描SSH日志文件，处理认证失败记录
+        线程安全，可被多个线程调用
+        """
         log_file = self.config["sshd_log_path"]
         
         # 确保日志文件存在
@@ -340,20 +359,17 @@ class SSHProxy:
             logger.error("无法访问SSH日志文件: %s", log_file)
             return
 
-        logger.info("开始监控SSH日志: %s", log_file)
-
-        # 记录上次读取位置
-        last_position = self.config.get("last_position", 0)
-        failure_patterns = constants.FAILURE_PATTERNS
-
-        while self.running:
+        with self.log_lock:
             try:
+                logger.info("获取 log 文件...")
                 # 检查文件大小
                 current_size = os.path.getsize(log_file)
+                last_position = self.config.get("last_position", 0)
 
                 if current_size < last_position:
                     logger.info("检测到日志文件轮转，从头开始读取")
                     self.config["last_position"] = 0
+                    last_position = 0
 
                 if current_size > last_position:
                     # 读取新日志
@@ -362,6 +378,8 @@ class SSHProxy:
                         new_lines = f.readlines()
                         self.config["last_position"] = f.tell()
 
+                    logger.info("读取了 %s 行新日志", len(new_lines))
+
                     # 处理新日志行
                     for line in new_lines:
                         line = line.strip()
@@ -369,9 +387,11 @@ class SSHProxy:
                             continue
 
                         # 检查日志行是否包含认证失败
-                        for pattern in failure_patterns:
+                        matched = False
+                        for pattern in constants.FAILURE_PATTERNS:
                             match = re.search(pattern, line)
                             if match:
+                                matched = True
                                 source_ip = match.group(1)
                                 try:
                                     source_port = int(match.group(2))
@@ -398,7 +418,7 @@ class SSHProxy:
                                 if client_info:
                                     real_ip = client_info["ip"]
 
-                                    # 记录失败，传递端口避免重复计数
+                                    # 记录失败（port参数已不再用于去重）
                                     failures = self.ban_manager.record_failure(real_ip, source_port)
                                     logger.warning(
                                         "IP %s 认证失败，累计 %s 次", real_ip, failures
@@ -416,14 +436,22 @@ class SSHProxy:
                                             self.mark_connection_for_closing(thread_id)
                                 else:
                                     # 没有找到端口映射
-                                    logger.debug("未找到端口 %s 的映射", source_port)
-
-                # 休眠
-                time.sleep(self.config["log_scan_interval"])
+                                    logger.info("未找到端口 %s 的映射", source_port)
+                                # 匹配到一个模式就跳出，避免重复处理
+                                break
+                        if not matched:
+                            # 可以调试未匹配的行
+                            logger.info("日志行未匹配失败模式: %s", line)
 
             except (FileNotFoundError, OSError, IOError) as e:
-                logger.error("监控日志时出错: %s", e)
-                time.sleep(10)
+                logger.error("扫描日志时出错: %s", e)
+
+    def monitor_sshd_logs(self):
+        """监控sshd日志的线程函数"""
+        while self.running:
+            self._scan_logs()
+            # 休眠，等待下次扫描
+            time.sleep(self.config["log_scan_interval"])
 
     def start_log_monitor(self):
         """启动日志监控线程"""
@@ -459,7 +487,7 @@ class SSHProxy:
             while self.running:
                 try:
                     client_sock, client_addr = self.server_socket.accept()
-                    logger.debug("接受新连接: %s", client_addr)
+                    logger.info("接受新连接: %s", client_addr)
 
                     # 在新线程中处理连接
                     thread = threading.Thread(

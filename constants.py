@@ -16,15 +16,18 @@ FAILURE_PATTERNS = [
 # 网络相关常量
 DEFAULT_BUFFER_SIZE = 4096
 SELECT_TIMEOUT = 1.0
-CONNECTION_TIMEOUT = 5.0
+CONNECTION_TIMEOUT = 2
 
 # 日志相关常量
-DEFAULT_LOG_LEVEL = logging.INFO
+if os.environ.get("loglevel", "info").lower() == "debug":
+    DEFAULT_LOG_LEVEL = logging.DEBUG
+else:
+    DEFAULT_LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # 文件相关常量
-DEFAULT_SSHD_LOG_PATH = "/data/data/com.termux/files/usr/var/auth.log"
+DEFAULT_SSHD_LOG_PATH = "/data/data/com.termux/files/usr/var/log/auth.log"
 os.makedirs("SSH_Proxy", exist_ok=True)
 BLACKLIST_FILE = "SSH_Proxy/blacklist.json"
 AUTH_FAILURES_LOG = "SSH_Proxy/auth_failures.log"

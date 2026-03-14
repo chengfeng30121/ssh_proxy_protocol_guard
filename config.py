@@ -4,17 +4,18 @@
 
 import os
 import json
-import logging
 
 import constants
 
-logger = logging.getLogger(__name__)
+from cfpackages.logger_formatter import get_logger
+
+logger = get_logger(__name__)
 
 
 # 默认配置
 DEFAULT_CONFIG = {
     "listen_host": "127.0.0.1",
-    "listen_port": 18080,
+    "listen_port": 18022,
     "sshd_host": "127.0.0.1",
     "sshd_port": 8022,
     "max_connections": constants.MAX_CONNECTIONS,

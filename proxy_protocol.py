@@ -4,9 +4,10 @@ Proxy Protocol解析器：支持Proxy Protocol v1和v2协议解析
 
 import socket
 import struct
-import logging
 
-logger = logging.getLogger(__name__)
+from cfpackages.logger_formatter import get_logger
+
+logger = get_logger(__name__)
 
 
 class ProxyProtocolParser:

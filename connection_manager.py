@@ -2,12 +2,13 @@
 连接管理器：管理SSH连接状态和端口映射
 """
 
-import logging
 import threading
 import time
 from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+from cfpackages.logger_formatter import get_logger
+
+logger = get_logger(__name__)
 
 
 class ConnectionManager:
