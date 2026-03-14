@@ -106,8 +106,12 @@ class BanManager:
     def is_banned(self, ip):
         """检查IP是否被封禁"""
         with self.lock:
+            print(ip)
+            print(self.blacklist)
             if ip not in self.blacklist:
                 return False
+
+            print("IP %s 已被封禁".format(ip))
 
             ban_info = self.blacklist[ip]
             block_until = ban_info.get("block_until", 0)
@@ -221,6 +225,7 @@ class BanManager:
             # 检查是否达到封禁阈值
             if failure_count >= self.max_failures and not self.is_banned(ip):
                 self.ban_ip(ip, reason=f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
+                logger.warning("已封禁IP %s，原因: %s", ip, f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
                 return failure_count
 
             return failure_count

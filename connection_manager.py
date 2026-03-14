@@ -6,9 +6,11 @@ import threading
 import time
 from collections import defaultdict
 
+import constants
+
 from cfpackages.logger_formatter import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger(__name__, constants.DEFAULT_LOG_LEVEL)
 
 
 class ConnectionManager:
