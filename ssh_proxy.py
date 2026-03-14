@@ -132,7 +132,20 @@ class SSHProxy:
         try:
             data = src_sock.recv(constants.DEFAULT_BUFFER_SIZE)
             if data:
-                dst_sock.sendall(data)
+                # 发送数据，处理非阻塞
+                total_sent = 0
+                while total_sent < len(data):
+                    try:
+                        sent = dst_sock.send(data[total_sent:])
+                        if sent == 0:
+                            return False  # 连接关闭
+                        total_sent += sent
+                    except BlockingIOError:
+                        continue  # 稍后重试
+                    except socket.error as e:
+                        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            continue
+                        return False
                 if direction == "sent":
                     self.conn_manager.update_activity(thread_id, sent=len(data))
                 else:
@@ -269,12 +282,8 @@ class SSHProxy:
             }
 
             # 检查IP是否被封禁
-            print("a")
             if self.ban_manager.is_banned(real_ip):
-                print("b")
                 ban_info = self.ban_manager.get_ban_info(real_ip)
-                print("c")
-                print(ban_info)
                 if ban_info:
                     remaining = ban_info["remaining_seconds"]
                     logger.warning(
@@ -283,7 +292,6 @@ class SSHProxy:
 
                 # 发送拒绝消息
                 try:
-                    # client_sock.sendall(b"SSH-2.0-OpenSSH_8.9\r\n")
                     client_sock.sendall(
                         b"Connection refused: Your IP has been blocked.\n"
                     )
@@ -293,7 +301,6 @@ class SSHProxy:
 
                 client_sock.close()
                 return
-            print("d")
 
             # 创建到sshd的连接
             sshd_sock, local_port = self.create_sshd_connection()
