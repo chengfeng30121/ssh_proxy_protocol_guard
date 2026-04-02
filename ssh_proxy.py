@@ -165,6 +165,7 @@ class SSHProxy:
         """转发连接数据"""
         thread_id = threading.get_ident()
         conn_id = None
+        client_ip = client_info['ip']  # 获取客户端IP用于检查
 
         # 添加到连接管理器
         if not self.conn_manager.add_connection(thread_id, client_info, local_port):
@@ -189,9 +190,13 @@ class SSHProxy:
                     )
 
             while time.time() - last_activity < timeout:
-                # 检查是否需要关闭连接
+                # 检查1: 线程是否被标记关闭
                 if self.should_close_connection(thread_id):
                     logger.info("连接 #%s 被标记为关闭", conn_id)
+                    break
+                # 检查2: IP是否被标记为需要断开 (新增)
+                if self.conn_manager.should_disconnect_ip(client_ip):
+                    logger.info("连接 #%s 的IP(%s)已被封禁，主动断开", conn_id, client_ip)
                     break
 
                 # 使用select等待数据
@@ -249,12 +254,16 @@ class SSHProxy:
             # 从连接管理器移除
             self.conn_manager.remove_connection(thread_id)
 
+            # 清理IP断开标记
+            self.conn_manager.cleanup_disconnected_ip(client_ip)
+
             # 从关闭列表中移除
             with self.connections_lock:
                 self.connections_to_close.discard(thread_id)
 
     def handle_client(self, client_sock, client_addr):
         """处理客户端连接"""
+        sshd_sock = None
         try:
             # 先设置超时，避免客户端不发送数据
             client_sock.settimeout(constants.CONNECTION_TIMEOUT)
@@ -271,9 +280,8 @@ class SSHProxy:
             else:
                 logger.info("解析到真实客户端: %s:%s", real_ip, real_port)
 
-            # 恢复socket为非阻塞模式
-            client_sock.setblocking(True)
-            client_sock.settimeout(None)
+            # 设置合理的超时而不是完全移除
+            client_sock.settimeout(constants.DEFAULT_SOCKET_TIMEOUT)
 
             client_info = {
                 "ip": real_ip,
@@ -284,22 +292,21 @@ class SSHProxy:
             # 检查IP是否被封禁
             if self.ban_manager.is_banned(real_ip):
                 ban_info = self.ban_manager.get_ban_info(real_ip)
-                if ban_info:
-                    remaining = ban_info["remaining_seconds"]
-                    logger.warning(
-                        "拒绝被封禁IP的连接: %s，剩余封禁时间: %s秒", real_ip, remaining
-                    )
+                remaining = ban_info.get("remaining_seconds", 0) if ban_info else 0
+                logger.warning(
+                    "拒绝被封禁IP的连接: %s，剩余封禁时间: %s秒", real_ip, remaining
+                )
 
-                # 发送拒绝消息
+                # 发送拒绝消息，设置发送超时
                 try:
+                    client_sock.settimeout(1.0)  # 设置发送超时
                     client_sock.sendall(
                         b"Connection refused: Your IP has been blocked.\n"
                     )
-                    time.sleep(1)
                 except (socket.error, OSError):
                     pass
-
-                client_sock.close()
+                finally:
+                    client_sock.close()
                 return
 
             # 创建到sshd的连接
@@ -316,13 +323,29 @@ class SSHProxy:
 
         except socket.timeout:
             logger.warning("连接超时: %s", client_addr)
-            client_sock.close()
         except (socket.error, OSError) as e:
             logger.error("处理客户端连接时出错: %s", e)
+        except Exception as e:
+            logger.error("处理客户端连接时发生未预期的错误: %s", e, exc_info=True)
+        finally:
+            # 确保关闭客户端socket
             try:
                 client_sock.close()
-            except (socket.error, OSError):
+            except:
                 pass
+            # 如果sshd_sock被创建但forward_connection没有接手管理，也关闭它
+            # 注意：在正常情况下，forward_connection会负责关闭sshd_sock
+            # 只有在create_sshd_connection成功但forward_connection未被调用时才需要在这里关闭
+            if sshd_sock is not None:
+                # 检查是否已经进入forward_connection（通过检查连接管理器）
+                # 如果连接管理器中没有这个线程，则说明forward_connection没有被调用
+                thread_id = threading.get_ident()
+                with self.conn_manager.lock:
+                    if thread_id not in self.conn_manager.active_connections:
+                        try:
+                            sshd_sock.close()
+                        except:
+                            pass
 
     def _ensure_sshd_log_file(self, log_file):
         """确保SSH日志文件存在且可访问"""
@@ -422,6 +445,14 @@ class SSHProxy:
                                 )
                                 if client_info:
                                     real_ip = client_info["ip"]
+                                    
+                                    # 检查是否是已关闭连接产生的失败（用于日志追踪）
+                                    if client_info.get("closed", False):
+                                        logger.debug(
+                                            "检测到已关闭连接的认证失败: %s:%s (关闭时间: %s)",
+                                            real_ip, source_port, 
+                                            datetime.fromtimestamp(client_info["closed_time"]).strftime("%Y-%m-%d %H:%M:%S")
+                                        )
 
                                     # 记录失败（port参数已不再用于去重）
                                     failures = self.ban_manager.record_failure(real_ip, source_port)

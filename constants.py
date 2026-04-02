@@ -17,6 +17,7 @@ FAILURE_PATTERNS = [
 DEFAULT_BUFFER_SIZE = 4096
 SELECT_TIMEOUT = 1.0
 CONNECTION_TIMEOUT = 2
+DEFAULT_SOCKET_TIMEOUT = 30  # 30秒的默认socket超时
 
 # 日志相关常量
 if os.environ.get("loglevel", "info").lower() == "debug":

@@ -24,6 +24,14 @@ class ConnectionManager:
         self.active_connections = {}  # thread_id -> connection_info
         self.port_mapping = {}  # local_port -> client_info
         self.ip_to_ports = defaultdict(set)  # ip -> set(local_ports)
+        
+        # 新增：延迟清理缓冲区
+        self.closed_port_mapping = {}  # local_port -> (client_info, closed_time)
+        self.cleanup_interval = 10  # 延迟清理的秒数
+        
+        # 新增：待强制断开的IP集合
+        self.ips_to_disconnect = set() # 待强制断开连接的IP集合
+        self.ips_lock = threading.Lock() # 保护上述集合的锁
 
         # 统计
         self.connection_counter = 0
@@ -79,29 +87,33 @@ class ConnectionManager:
                 conn["bytes_received"] += received
 
     def remove_connection(self, thread_id):
-        """移除连接"""
+        """移除连接，但将端口映射移至延迟清理缓冲区。"""
         with self.lock:
             if thread_id in self.active_connections:
                 conn = self.active_connections[thread_id]
                 local_port = conn["local_port"]
                 client_ip = conn["client_info"]["ip"]
 
-                # 从端口映射中移除
+                # 从活动连接中移除
+                del self.active_connections[thread_id]
+                
+                # 从port_mapping中移除 (活动映射)
                 if local_port in self.port_mapping:
                     del self.port_mapping[local_port]
+                    
+                # 添加到延迟清理缓冲区
+                self.closed_port_mapping[local_port] = (conn["client_info"].copy(), time.time())
 
-                # 从IP到端口的映射中移除
+                # 从IP到端口的映射中移除（仍需立即清理，因为它用于按IP查活动连接）
                 if client_ip in self.ip_to_ports:
                     self.ip_to_ports[client_ip].discard(local_port)
                     if not self.ip_to_ports[client_ip]:
                         del self.ip_to_ports[client_ip]
 
-                # 从活动连接中移除
+                # 记录日志
                 client_info = conn["client_info"]
                 duration = time.time() - conn["start_time"]
                 bytes_total = conn["bytes_sent"] + conn["bytes_received"]
-
-                del self.active_connections[thread_id]
 
                 logger.info(
                     "移除连接 #%s: %s:%s, 持续时间: %.1fs, 流量: %s字节",
@@ -110,10 +122,19 @@ class ConnectionManager:
                 )
 
     def get_client_by_port(self, local_port):
-        """通过本地端口获取客户端信息"""
+        """通过本地端口获取客户端信息。优先从活动连接查，其次从延迟缓冲区查。"""
         with self.lock:
+            # 1. 先查活动连接
             if local_port in self.port_mapping:
                 return self.port_mapping[local_port]
+            # 2. 再查延迟清理缓冲区
+            if local_port in self.closed_port_mapping:
+                client_info, closed_time = self.closed_port_mapping[local_port]
+                # 返回client_info，并添加closed标记以便追踪
+                info = client_info.copy()
+                info["closed"] = True
+                info["closed_time"] = closed_time
+                return info
         return None
 
     def get_connections_by_ip(self, ip):
@@ -127,7 +148,7 @@ class ConnectionManager:
             return connections
 
     def disconnect_ip(self, ip):
-        """断开指定IP的所有连接，返回需要断开的线程ID列表"""
+        """断开指定IP的所有连接。此调用会标记该IP，转发线程将在下次检查时自行关闭。"""
         with self.lock:
             threads_to_disconnect = []
 
@@ -136,7 +157,10 @@ class ConnectionManager:
                     threads_to_disconnect.append(thread_id)
 
             if threads_to_disconnect:
-                logger.info("需要断开IP %s 的 %s 个连接", ip, len(threads_to_disconnect))
+                logger.info("标记IP %s 的 %s 个连接为待断开", ip, len(threads_to_disconnect))
+                # 新增：将IP添加到待断开集合
+                with self.ips_lock:
+                    self.ips_to_disconnect.add(ip)
 
                 # 记录要断开的连接
                 for thread_id in threads_to_disconnect:
@@ -144,6 +168,16 @@ class ConnectionManager:
                     logger.info("标记连接 #%s 为断开", conn['conn_id'])
 
             return threads_to_disconnect
+
+    def should_disconnect_ip(self, ip):
+        """检查某个IP是否被标记为需要断开。转发线程调用。"""
+        with self.ips_lock:
+            return ip in self.ips_to_disconnect
+
+    def cleanup_disconnected_ip(self, ip):
+        """清理已断开IP的标记。在转发线程确认连接关闭后调用。"""
+        with self.ips_lock:
+            self.ips_to_disconnect.discard(ip)
 
     def get_stats(self):
         """获取统计信息"""
@@ -156,7 +190,7 @@ class ConnectionManager:
             }
 
     def _cleanup_loop(self):
-        """清理超时连接"""
+        """清理超时连接 以及 延迟清理缓冲区中的过期条目。"""
         while True:
             time.sleep(60)  # 每分钟清理一次
             try:
@@ -189,6 +223,16 @@ class ConnectionManager:
                             "清理超时连接 #%s: %s:%s",
                             conn['conn_id'], conn['client_info']['ip'], conn['client_info']['port']
                         )
+
+                    # 新增：清理延迟缓冲区中超时的条目
+                    ports_to_remove = []
+                    for port, (_, closed_time) in self.closed_port_mapping.items():
+                        if now - closed_time > self.cleanup_interval:
+                            ports_to_remove.append(port)
+                    for port in ports_to_remove:
+                        del self.closed_port_mapping[port]
+                    if ports_to_remove:
+                        logger.debug("从延迟清理缓冲区中移除了 %s 个过期端口映射", len(ports_to_remove))
 
                 if to_remove:
                     logger.info("清理了 %s 个超时连接", len(to_remove))
