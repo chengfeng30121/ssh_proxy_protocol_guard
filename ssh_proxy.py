@@ -86,9 +86,6 @@ class SSHProxy:
         self.server_socket = None
         self.running = False
 
-        # 日志扫描锁
-        self.log_lock = threading.Lock()
-
         logger.info("SSH代理初始化完成")
         logger.info("封禁阈值: %s次/%s秒", self.config["failures_to_ban"], self.config["failure_window"])
 
@@ -194,8 +191,8 @@ class SSHProxy:
                 if self.should_close_connection(thread_id):
                     logger.info("连接 #%s 被标记为关闭", conn_id)
                     break
-                # 检查2: IP是否被标记为需要断开 (新增)
-                if self.conn_manager.should_disconnect_ip(client_ip):
+                # 检查2: IP是否被封禁
+                if self.ban_manager.is_banned(client_ip):
                     logger.info("连接 #%s 的IP(%s)已被封禁，主动断开", conn_id, client_ip)
                     break
 
@@ -235,31 +232,38 @@ class SSHProxy:
         except (select.error, socket.error) as e:
             logger.error("连接 #%s 转发数据时出错: %s", conn_id, e)
         finally:
-            # 等待一小段时间，确保日志已写入
-            time.sleep(0.1)
-            # 立即扫描一次日志，以便处理该连接可能产生的失败
-            self._scan_logs()
-
-            # 清理资源
+            # 记录调试信息
+            logger.debug("开始清理连接 #%s (端口: %s)", conn_id, local_port)
+            
+            # 关闭socket
             try:
                 client_sock.close()
-            except (socket.error, OSError):
+            except:
                 pass
-
             try:
                 sshd_sock.close()
-            except (socket.error, OSError):
+            except:
                 pass
-
-            # 从连接管理器移除
-            self.conn_manager.remove_connection(thread_id)
-
-            # 清理IP断开标记
-            self.conn_manager.cleanup_disconnected_ip(client_ip)
-
-            # 从关闭列表中移除
-            with self.connections_lock:
-                self.connections_to_close.discard(thread_id)
+            
+            # 简单地从连接管理器中移除（不立即删除端口映射）
+            with self.conn_manager.lock:
+                if thread_id in self.conn_manager.active_connections:
+                    # 保存连接信息到临时变量，用于可能的日志匹配
+                    conn_info = self.conn_manager.active_connections[thread_id]
+                    # 标记为已关闭
+                    conn_info["closed"] = True
+                    conn_info["closed_time"] = time.time()
+                    
+                    # 不立即删除端口映射，但标记为关闭
+                    local_port = conn_info["local_port"]
+                    if local_port in self.conn_manager.port_mapping:
+                        self.conn_manager.port_mapping[local_port]["closed"] = True
+                        self.conn_manager.port_mapping[local_port]["closed_time"] = time.time()
+                    
+                    # 从活动连接字典中移除
+                    del self.conn_manager.active_connections[thread_id]
+            
+            logger.debug("连接 #%s 清理完成", conn_id)
 
     def handle_client(self, client_sock, client_addr):
         """处理客户端连接"""
@@ -378,7 +382,6 @@ class SSHProxy:
     def _scan_logs(self):
         """
         扫描SSH日志文件，处理认证失败记录
-        线程安全，可被多个线程调用
         """
         log_file = self.config["sshd_log_path"]
         
@@ -387,100 +390,81 @@ class SSHProxy:
             logger.error("无法访问SSH日志文件: %s", log_file)
             return
 
-        with self.log_lock:
-            try:
-                logger.info("获取 log 文件...")
-                # 检查文件大小
-                current_size = os.path.getsize(log_file)
-                last_position = self.config.get("last_position", 0)
+        try:
+            # 1. 先读取所有新日志行
+            current_size = os.path.getsize(log_file)
+            last_position = self.config.get("last_position", 0)
 
-                if current_size < last_position:
-                    logger.info("检测到日志文件轮转，从头开始读取")
-                    self.config["last_position"] = 0
-                    last_position = 0
+            if current_size < last_position:
+                logger.info("检测到日志文件轮转，从头开始读取")
+                self.config["last_position"] = 0
+                last_position = 0
 
-                if current_size > last_position:
-                    # 读取新日志
-                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                        f.seek(last_position)
-                        new_lines = f.readlines()
-                        self.config["last_position"] = f.tell()
+            if current_size > last_position:
+                new_lines = []
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(last_position)
+                    new_lines = f.readlines()
+                    self.config["last_position"] = f.tell()
 
-                    logger.info("读取了 %s 行新日志", len(new_lines))
+                logger.info("读取了 %s 行新日志", len(new_lines))
 
-                    # 处理新日志行
-                    for line in new_lines:
-                        line = line.strip()
-                        if not line:
-                            continue
+                # 2. 处理每一行（不使用ConnectionManager的锁保护整个过程）
+                for line in new_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # 检查认证失败
+                    for pattern in constants.FAILURE_PATTERNS:
+                        match = re.search(pattern, line)
+                        if match:
+                            source_ip = match.group(1)
+                            try:
+                                source_port = int(match.group(2))
+                            except (ValueError, IndexError):
+                                source_port = 0
 
-                        # 检查日志行是否包含认证失败
-                        matched = False
-                        for pattern in constants.FAILURE_PATTERNS:
-                            match = re.search(pattern, line)
-                            if match:
-                                matched = True
-                                source_ip = match.group(1)
-                                try:
-                                    source_port = int(match.group(2))
-                                except (ValueError, IndexError):
-                                    source_port = 0
+                            logger.info(
+                                "检测到认证失败: %s:%s - %s...",
+                                source_ip,
+                                source_port,
+                                line[:100],
+                            )
 
-                                logger.info(
-                                    "检测到认证失败: %s:%s - %s...",
-                                    source_ip,
-                                    source_port,
-                                    line[:100],
-                                )
+                            # 记录到失败日志
+                            failures_log = constants.AUTH_FAILURES_LOG
+                            if ensure_file_path(failures_log):
+                                with open(failures_log, "a", encoding="utf-8") as f:
+                                    f.write(f"{datetime.now()} - {line}\n")
 
-                                # 记录到失败日志
-                                failures_log = constants.AUTH_FAILURES_LOG
-                                if ensure_file_path(failures_log):
-                                    with open(failures_log, "a", encoding="utf-8") as f:
-                                        f.write(f"{datetime.now()} - {line}\n")
+                            # 3. 获取客户端信息（快速检查，不持有锁太久）
+                            client_info = None
+                            with self.conn_manager.lock:
+                                if source_port in self.conn_manager.port_mapping:
+                                    client_info = self.conn_manager.port_mapping[source_port]
+                            
+                            if client_info:
+                                real_ip = client_info["ip"]
+                                
+                                # 记录失败
+                                failures = self.ban_manager.record_failure(real_ip, source_port)
+                                logger.warning("IP %s 认证失败，累计 %s 次", real_ip, failures)
+                                
+                                # 如果被封禁，断开连接
+                                if self.ban_manager.is_banned(real_ip):
+                                    logger.warning("IP %s 已被封禁，断开连接", real_ip)
+                                    threads = self.conn_manager.disconnect_ip(real_ip)
+                                    for thread_id in threads:
+                                        self.mark_connection_for_closing(thread_id)
+                            else:
+                                # 没有找到端口映射
+                                logger.debug("未找到端口 %s 的映射", source_port)
+                            # 匹配到一个模式就跳出
+                            break
 
-                                # 通过端口查找真实IP
-                                client_info = self.conn_manager.get_client_by_port(
-                                    source_port
-                                )
-                                if client_info:
-                                    real_ip = client_info["ip"]
-                                    
-                                    # 检查是否是已关闭连接产生的失败（用于日志追踪）
-                                    if client_info.get("closed", False):
-                                        logger.debug(
-                                            "检测到已关闭连接的认证失败: %s:%s (关闭时间: %s)",
-                                            real_ip, source_port, 
-                                            datetime.fromtimestamp(client_info["closed_time"]).strftime("%Y-%m-%d %H:%M:%S")
-                                        )
-
-                                    # 记录失败（port参数已不再用于去重）
-                                    failures = self.ban_manager.record_failure(real_ip, source_port)
-                                    logger.warning(
-                                        "IP %s 认证失败，累计 %s 次", real_ip, failures
-                                    )
-
-                                    # 如果被封禁，断开连接
-                                    if self.ban_manager.is_banned(real_ip):
-                                        logger.warning(
-                                            "IP %s 已被封禁，断开连接", real_ip
-                                        )
-                                        threads = self.conn_manager.disconnect_ip(
-                                            real_ip
-                                        )
-                                        for thread_id in threads:
-                                            self.mark_connection_for_closing(thread_id)
-                                else:
-                                    # 没有找到端口映射
-                                    logger.debug("未找到端口 %s 的映射", source_port)
-                                # 匹配到一个模式就跳出，避免重复处理
-                                break
-                        if not matched:
-                            # 可以调试未匹配的行
-                            logger.debug("日志行未匹配失败模式: %s", line)
-
-            except (FileNotFoundError, OSError, IOError) as e:
-                logger.error("扫描日志时出错: %s", e)
+        except (FileNotFoundError, OSError, IOError) as e:
+            logger.error("扫描日志时出错: %s", e)
 
     def monitor_sshd_logs(self):
         """监控sshd日志的线程函数"""
