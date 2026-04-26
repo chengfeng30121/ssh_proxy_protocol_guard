@@ -10,29 +10,11 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 import constants
+from constants import ensure_file_path
 
 from cfpackages.logger_formatter import get_logger
 
 logger = get_logger(__name__)
-
-
-def ensure_file_path(path):
-    """确保文件路径存在，如果不存在则创建父目录"""
-    try:
-        if not path:
-            return False
-            
-        parent_dir = os.path.dirname(path)
-        if not parent_dir:
-            return True
-            
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-            
-        return True
-    except (OSError, PermissionError) as e:
-        logger.error("创建目录失败 %s: %s", parent_dir, e)
-        return False
 
 
 class BanManager:
@@ -122,7 +104,7 @@ class BanManager:
             return True
 
     def ban_ip(self, ip, duration=None, reason="Too many failed attempts"):
-        """封禁IP"""
+        """封禁IP（供外部调用，内部有锁）"""
         if duration is None:
             duration = self.ban_duration
 
@@ -215,22 +197,43 @@ class BanManager:
 
             failure_count = len(self.failure_count[ip])
 
-            # 记录失败日志
+            # 记录失败日志（此方法内部没有锁，安全）
             self._log_failure(ip, failure_count)
 
-            # 检查是否达到封禁阈值（在锁内直接判断，避免死锁）
+            # 检查是否达到封禁阈值（直接检查 blacklist，避免死锁）
             should_ban = False
             if failure_count >= self.max_failures:
-                # 检查当前是否已封禁且未过期（直接访问 blacklist，已在锁内）
                 if ip not in self.blacklist or now > self.blacklist[ip].get("block_until", 0):
                     should_ban = True
 
             if should_ban:
-                self.ban_ip(ip, reason=f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
-                logger.warning("已封禁IP %s，原因: %s", ip, f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
+                # 不能调用 self.ban_ip()，因为它会再次加锁导致死锁
+                # 直接在此处完成封禁操作（已在锁内）
+                duration = self.ban_duration
+                block_until = now + duration
+                self.blacklist[ip] = {
+                    "block_until": block_until,
+                    "reason": f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)",
+                    "banned_at": now,
+                }
+
+                # 清理该IP的失败记录
+                if ip in self.failure_count:
+                    del self.failure_count[ip]
+
+                # 保存黑名单到文件（此方法内部无锁）
+                self.save_blacklist()
+
+                # 记录封禁日志
+                logger.warning(
+                    "已封禁IP %s 直到 %s，原因: %s",
+                    ip, datetime.fromtimestamp(block_until), 
+                    f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)"
+                )
+                self._log_ban_action(f"BAN {ip} for {duration}s: {failure_count}次认证失败 ({self.failure_window//60}分钟内)")
 
             return failure_count
-
+    
     def get_ban_info(self, ip):
         """获取封禁信息"""
         with self.lock:

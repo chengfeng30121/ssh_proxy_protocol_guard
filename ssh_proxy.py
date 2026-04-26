@@ -15,44 +15,13 @@ from datetime import datetime
 from proxy_protocol import ProxyProtocolParser
 from connection_manager import ConnectionManager
 from ban_manager import BanManager
-from config import load_config, validate_config, save_config
+from config import load_config, validate_config, load_state, save_state
 import constants
+from constants import ensure_file_path
 
 from cfpackages.logger_formatter import get_logger
 
 logger = get_logger(__name__, constants.DEFAULT_LOG_LEVEL)
-
-
-def ensure_file_path(path):
-    """
-    确保文件路径存在，如果不存在则创建父目录
-    
-    Args:
-        path: 文件路径
-        
-    Returns:
-        bool: 是否成功
-    """
-    try:
-        if not path:
-            logger.error("文件路径为空")
-            return False
-            
-        # 获取父目录
-        parent_dir = os.path.dirname(path)
-        if not parent_dir:
-            # 没有父目录，是当前目录下的文件
-            return True
-            
-        # 创建目录（如果不存在）
-        if not os.path.exists(parent_dir):
-            logger.info("创建目录: %s", parent_dir)
-            os.makedirs(parent_dir, exist_ok=True)
-            
-        return True
-    except (OSError, PermissionError) as e:
-        logger.error("创建目录失败 %s: %s", parent_dir, e)
-        return False
 
 
 class SSHProxy:
@@ -85,6 +54,9 @@ class SSHProxy:
         # 服务器socket
         self.server_socket = None
         self.running = False
+
+        # 加载运行时状态（如日志扫描位置）
+        self.state = load_state()
 
         logger.info("SSH代理初始化完成")
         logger.info("封禁阈值: %s次/%s秒", self.config["failures_to_ban"], self.config["failure_window"])
@@ -393,11 +365,11 @@ class SSHProxy:
         try:
             # 1. 先读取所有新日志行
             current_size = os.path.getsize(log_file)
-            last_position = self.config.get("last_position", 0)
+            last_position = self.state.get("last_position", 0)
 
             if current_size < last_position:
                 logger.info("检测到日志文件轮转，从头开始读取")
-                self.config["last_position"] = 0
+                self.state["last_position"] = 0
                 last_position = 0
 
             if current_size > last_position:
@@ -405,7 +377,7 @@ class SSHProxy:
                 with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                     f.seek(last_position)
                     new_lines = f.readlines()
-                    self.config["last_position"] = f.tell()
+                    self.state["last_position"] = f.tell()
 
                 logger.info("读取了 %s 行新日志", len(new_lines))
 
@@ -542,9 +514,10 @@ class SSHProxy:
             except (socket.error, OSError):
                 pass
 
-        # 保存状态
+        # 保存状态和黑名单
         self.ban_manager.save_blacklist()
-        logger.info("黑名单已保存")
+        save_state(self.state)
+        logger.info("状态和黑名单已保存")
 
 
 def main():
@@ -560,8 +533,6 @@ def main():
     except (socket.error, OSError) as e:
         logger.error("代理运行出错: %s", e)
         proxy.stop()
-    finally:
-        save_config(proxy.config)
 
 
 if __name__ == "__main__":

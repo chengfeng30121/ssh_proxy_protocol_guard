@@ -1,5 +1,5 @@
 """
-常量定义：统一管理SSH代理中的所有常量
+常量定义：统一管理SSH代理中的所有常量和工具函数
 """
 import logging
 import os
@@ -8,9 +8,6 @@ import os
 FAILURE_PATTERNS = [
     r"Failed password for .* from ([\d\.]+) port (\d+)",
     r"Invalid user .* from ([\d\.]+) port (\d+)",
-#   r"Connection closed by authenticating user .* ([\d\.]+) port (\d+)",
-#   r"error: maximum authentication attempts exceeded for .* from ([\d\.]+) port (\d+)",
-#   r"Received disconnect from ([\d\.]+) port (\d+):.*authfail",
 ]
 
 # 网络相关常量
@@ -42,3 +39,30 @@ DEFAULT_BAN_DURATION = 3600  # 1小时
 MAX_FAILURES = 5
 FAILURE_WINDOW = 600  # 10分钟
 MAX_CONNECTIONS = 20
+
+
+def ensure_file_path(path):
+    """
+    确保文件路径存在，如果不存在则创建父目录
+    
+    Args:
+        path: 文件路径
+        
+    Returns:
+        bool: 是否成功
+    """
+    try:
+        if not path:
+            return False
+            
+        parent_dir = os.path.dirname(path)
+        if not parent_dir:
+            return True
+            
+        if not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+            
+        return True
+    except (OSError, PermissionError) as e:
+        # 不能导入 logger，此处只返回 False，由调用者处理日志
+        return False

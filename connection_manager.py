@@ -184,7 +184,6 @@ class ConnectionManager:
                             if now - closed_time > 600:  # 10分钟
                                 ports_to_remove.append(port)
                     
-                    # 注意：这里原来的拼写是 ports_to_remove，现已修正
                     for port in ports_to_remove:
                         del self.port_mapping[port]
                     
@@ -196,4 +195,3 @@ class ConnectionManager:
     
             except (OSError, RuntimeError) as e:
                 logger.error("清理连接时出错: %s", e)
-    

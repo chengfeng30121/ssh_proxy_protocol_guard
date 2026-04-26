@@ -224,9 +224,8 @@ class ProxyProtocolParser:
 
             if data.startswith(b"PROXY "):
                 logger.debug("检测到Proxy Protocol v1，尝试解析...")
-                # 消费偷看的数据
-                client_sock.recv(16)
-                # 重新读取完整行
+                # 注意：v1不能消费偷看的数据，否则 parse_v1 会丢失前缀
+                # 直接调用 parse_v1，它会自己从 socket 读取完整行
                 return ProxyProtocolParser.parse_v1(client_sock)
 
             logger.debug("未检测到Proxy Protocol，使用连接地址")
