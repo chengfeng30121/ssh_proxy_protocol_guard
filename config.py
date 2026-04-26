@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
 # 运行时状态文件路径
 STATE_FILE = "SSH_Proxy/state.json"
 
-# 配置文件注释（写入文件顶部，便于用户理解）
+# 配置文件注释
 CONFIG_HELP = {
     "_comment": "SSH Proxy Protocol Guard 配置文件。修改后重启生效。",
     "listen_host": "代理监听地址",
@@ -61,8 +61,8 @@ def load_config(config_file=constants.CONFIG_PATH, config_dict=None):
             if not ensure_file_path(config_file):
                 logger.warning("无法创建配置文件目录: %s", config_file)
             elif not os.path.exists(config_file):
-                # 自动创建默认配置文件，并附带帮助信息
-                save_config(DEFAULT_CONFIG, config_file, add_help=True)
+                # 自动创建默认配置文件
+                save_config(DEFAULT_CONFIG, config_file)
                 logger.info("已创建默认配置文件: %s", config_file)
             else:
                 with open(config_file, 'r', encoding='utf-8') as f:
@@ -95,7 +95,7 @@ def load_config(config_file=constants.CONFIG_PATH, config_dict=None):
     return config
 
 
-def save_config(config, config_file=constants.CONFIG_PATH, add_help=False):
+def save_config(config, config_file=constants.CONFIG_PATH):
     """
     保存配置到文件。只保存 DEFAULT_CONFIG 中定义的键，避免写入运行时状态。
     add_help=True 时会在顶部添加注释信息。
@@ -109,10 +109,6 @@ def save_config(config, config_file=constants.CONFIG_PATH, add_help=False):
         export = {k: config.get(k, DEFAULT_CONFIG[k]) for k in DEFAULT_CONFIG}
         
         with open(config_file, 'w', encoding='utf-8') as f:
-            if add_help:
-                # 写入帮助注释（JSON不支持注释，所以写入一个 _comment 字段）
-                json.dump(CONFIG_HELP, f, indent=2, ensure_ascii=False)
-                f.write("\n\n")
             json.dump(export, f, indent=2, ensure_ascii=False)
 
         logger.info("配置已保存到: %s", config_file)

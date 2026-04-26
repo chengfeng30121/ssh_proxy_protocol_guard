@@ -142,6 +142,15 @@ class BanManager:
                 return True
         return False
 
+    def clear_failures(self, ip):
+        """清除指定IP的失败记录（登录成功后调用）"""
+        with self.lock:
+            if ip in self.failure_count:
+                del self.failure_count[ip]
+                logger.info("已清除IP %s 的失败记录（登录成功）", ip)
+                return True
+        return False
+
     def _log_ban_action(self, message):
         """记录封禁/解封日志"""
         ban_log = constants.BAN_ACTIONS_LOG

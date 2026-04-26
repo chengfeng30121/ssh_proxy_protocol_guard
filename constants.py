@@ -4,10 +4,16 @@
 import logging
 import os
 
-# SSH日志正则表达式模式
+# SSH日志正则表达式模式 — 认证失败
 FAILURE_PATTERNS = [
     r"Failed password for .* from ([\d\.]+) port (\d+)",
     r"Invalid user .* from ([\d\.]+) port (\d+)",
+]
+
+# SSH日志正则表达式模式 — 认证成功
+SUCCESS_PATTERNS = [
+    r"Accepted password for .* from ([\d\.]+) port (\d+)",
+    r"Accepted publickey for .* from ([\d\.]+) port (\d+)",
 ]
 
 # 网络相关常量

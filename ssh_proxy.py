@@ -353,7 +353,8 @@ class SSHProxy:
 
     def _scan_logs(self):
         """
-        扫描SSH日志文件，处理认证失败记录
+        扫描SSH日志文件，处理认证失败和成功记录。
+        失败时累计次数并可能触发封禁；成功时清除该 IP 的失败记录。
         """
         log_file = self.config["sshd_log_path"]
         
@@ -381,13 +382,53 @@ class SSHProxy:
 
                 logger.info("读取了 %s 行新日志", len(new_lines))
 
-                # 2. 处理每一行（不使用ConnectionManager的锁保护整个过程）
+                # 2. 处理每一行
                 for line in new_lines:
                     line = line.strip()
                     if not line:
                         continue
                     
-                    # 检查认证失败
+                    # ---------------------------
+                    # 先检查认证成功（登录成功应重置失败计数）
+                    # ---------------------------
+                    success_matched = False
+                    for pattern in constants.SUCCESS_PATTERNS:
+                        match = re.search(pattern, line)
+                        if match:
+                            source_ip = match.group(1)
+                            try:
+                                source_port = int(match.group(2))
+                            except (ValueError, IndexError):
+                                source_port = 0
+
+                            # 获取真实客户端IP
+                            client_info = None
+                            with self.conn_manager.lock:
+                                if source_port in self.conn_manager.port_mapping:
+                                    client_info = self.conn_manager.port_mapping[source_port]
+                            
+                            if client_info:
+                                real_ip = client_info["ip"]
+                                logger.info(
+                                    "检测到认证成功: %s:%s（真实IP: %s），清除失败记录",
+                                    source_ip, source_port, real_ip
+                                )
+                                self.ban_manager.clear_failures(real_ip)
+                            else:
+                                logger.debug(
+                                    "检测到认证成功但未找到端口映射: %s:%s",
+                                    source_ip, source_port
+                                )
+                            success_matched = True
+                            break
+
+                    # 如果已匹配到成功，跳过失败检查
+                    if success_matched:
+                        continue
+
+                    # ---------------------------
+                    # 再检查认证失败
+                    # ---------------------------
                     for pattern in constants.FAILURE_PATTERNS:
                         match = re.search(pattern, line)
                         if match:
@@ -397,20 +438,13 @@ class SSHProxy:
                             except (ValueError, IndexError):
                                 source_port = 0
 
-                            logger.info(
-                                "检测到认证失败: %s:%s - %s...",
-                                source_ip,
-                                source_port,
-                                line[:100],
-                            )
-
                             # 记录到失败日志
                             failures_log = constants.AUTH_FAILURES_LOG
                             if ensure_file_path(failures_log):
                                 with open(failures_log, "a", encoding="utf-8") as f:
                                     f.write(f"{datetime.now()} - {line}\n")
 
-                            # 3. 获取客户端信息（快速检查，不持有锁太久）
+                            # 获取真实客户端IP
                             client_info = None
                             with self.conn_manager.lock:
                                 if source_port in self.conn_manager.port_mapping:
@@ -418,6 +452,14 @@ class SSHProxy:
                             
                             if client_info:
                                 real_ip = client_info["ip"]
+
+                                logger.info(
+                                    "检测到认证失败: %s:%s（真实IP: %s）- %s...",
+                                    source_ip,
+                                    source_port,
+                                    real_ip,
+                                    line[:100],
+                                )
                                 
                                 # 记录失败
                                 failures = self.ban_manager.record_failure(real_ip, source_port)
