@@ -207,7 +207,7 @@ class BanManager:
             # 添加当前失败时间
             self.failure_count[ip].append(now)
 
-            # 清理过期记录（10分钟前）
+            # 清理过期记录（failure_window 之前）
             self.failure_count[ip] = deque(
                 [t for t in self.failure_count[ip] if now - t < self.failure_window],
                 maxlen=10,
@@ -218,11 +218,16 @@ class BanManager:
             # 记录失败日志
             self._log_failure(ip, failure_count)
 
-            # 检查是否达到封禁阈值
-            if failure_count >= self.max_failures and not self.is_banned(ip):
+            # 检查是否达到封禁阈值（在锁内直接判断，避免死锁）
+            should_ban = False
+            if failure_count >= self.max_failures:
+                # 检查当前是否已封禁且未过期（直接访问 blacklist，已在锁内）
+                if ip not in self.blacklist or now > self.blacklist[ip].get("block_until", 0):
+                    should_ban = True
+
+            if should_ban:
                 self.ban_ip(ip, reason=f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
                 logger.warning("已封禁IP %s，原因: %s", ip, f"{failure_count}次认证失败 ({self.failure_window//60}分钟内)")
-                return failure_count
 
             return failure_count
 

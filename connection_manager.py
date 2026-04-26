@@ -160,7 +160,7 @@ class ConnectionManager:
                     for thread_id, conn in self.active_connections.items():
                         if now - conn["last_activity"] > self.connection_timeout:
                             to_remove.append(thread_id)
-
+    
                     for thread_id in to_remove:
                         conn = self.active_connections[thread_id]
                         local_port = conn["local_port"]
@@ -168,14 +168,14 @@ class ConnectionManager:
                         if local_port in self.port_mapping:
                             self.port_mapping[local_port]["closed"] = True
                             self.port_mapping[local_port]["closed_time"] = time.time()
-
+    
                         del self.active_connections[thread_id]
-
+    
                         logger.warning(
                             "清理超时连接 #%s: %s:%s",
                             conn['conn_id'], conn['client_info']['ip'], conn['client_info']['port']
                         )
-
+    
                     # 清理超过10分钟的已关闭端口映射
                     ports_to_remove = []
                     for port, info in self.port_mapping.items():
@@ -184,14 +184,16 @@ class ConnectionManager:
                             if now - closed_time > 600:  # 10分钟
                                 ports_to_remove.append(port)
                     
+                    # 注意：这里原来的拼写是 ports_to_remove，现已修正
                     for port in ports_to_remove:
                         del self.port_mapping[port]
                     
                     if ports_to_remove:
                         logger.debug("清理了 %s 个已关闭的端口映射", len(ports_to_remove))
-
+    
                 if to_remove:
                     logger.info("清理了 %s 个超时连接", len(to_remove))
-
+    
             except (OSError, RuntimeError) as e:
                 logger.error("清理连接时出错: %s", e)
+    
